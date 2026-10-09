@@ -66,6 +66,15 @@ KV bytes per token = layers × (kv_lora_rank + qk_rope_head_dim) × bytes_per_el
 
 **Mixture of experts:** weight memory counts every expert, because all of them must be resident in VRAM. Only the KV cache follows attention, so MoE doesn't change it.
 
+
+## The Takeaways
+
+- GPU memory holds two things: weights and KV cache. Weights are a fixed cost you pay once. The KV cache grows with every token of every user. Once a model is loaded, the KV cache decides how many users one GPU can serve.
+- Most new attention designs exist to shrink the KV cache. Llama 3 8B's GQA makes its cache 4× smaller than plain multi-head attention would. An fp8 cache halves it again. MLA compresses it further, which is why DeepSeek-V2-Lite serves 180 sequences where Llama 3 8B serves 57, despite being twice Llama's size.
+- MoE separates speed from memory. Speed comes from the active parameters (about 13B for Mixtral). Memory comes from the total (46.7B). So "fast and cheap per token" can still mean "needs two GPUs."
+- Halving precision more than doubles capacity. fp8 shrinks both the weights and the cache, which took Llama 3 8B from 57 to 129 sequences.
+  
+
 ## Limitations
 
 - Assumes every sequence uses the full context length. With paged KV allocation (vLLM, SGLang), real concurrency on shorter requests is higher; this is the worst-case floor.
