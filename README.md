@@ -137,3 +137,10 @@ Recent `llama-server` builds hide model-loading details at the default log level
 - Treats multiple GPUs as one pool. Tensor parallelism adds per-card overhead, so multi-GPU numbers are slightly optimistic.
 - Ignores small terms such as attention biases (e.g. Qwen QKV bias, ~0.002% of params).
 - MLA numbers assume the serving engine stores the compressed latent, as vLLM and SGLang do.
+
+## The Takeaways
+- GPU memory holds two things: weights and KV cache. Weights are a fixed cost. The KV cache scales with tokens and users, and engines like llama.cpp reserve all of it at startup. Once a model is loaded, the KV cache decides how many users one GPU can serve.
+- Most new attention designs exist to shrink the KV cache. Llama 3 8B's GQA makes its cache 4× smaller than plain multi-head attention would. - An 8-bit cache roughly halves it again (llama.cpp's q8_0 is 6% over half, because of block scales). MLA compresses it further, which is why DeepSeek-V2-Lite serves 180 sequences where Llama 3 8B serves 57, despite being twice Llama's size.
+- MoE separates speed from memory. Speed comes from the active parameters (about 13B for Mixtral). Memory comes from the total (46.7B). So "fast and cheap per token" can still mean "needs two GPUs."
+- Weight precision and KV precision are separate settings. Quantizing the weights to 4-bit left the cache at f16. Changing both to fp8 took Llama 3 8B from 57 to 129 sequences; changing only one gives you less.
+- The formula is exact; the engine's accounting is where the surprises are. llama.cpp matched kvcalc to the MiB. The gaps came from how it counts: -c is a total split across slots, and quantized formats store extra bytes for scales.
