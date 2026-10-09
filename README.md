@@ -42,6 +42,39 @@ Max concurrent:   57  (on 80.0 GiB @ 90%)
 
 Gated models (e.g. Mixtral) need `huggingface-cli login` and license acceptance on the model page.
 
+## Model comparison: how grouped-query attention shrinks KV
+
+All numbers from kvcalc at fp16 weights and KV, 8192-token context, 90% utilization.
+
+| Model | Layers | Query heads | KV heads | Weights | KV / token | KV / token if MHA | GQA saving | KV / 8k seq | Max seqs |
+|---|---|---|---|---|---|---|---|---|---|
+| Llama 3 8B | 32 | 32 | 8 | 14.96 GiB | 128 KiB | 512 KiB | 4× | 1.00 GiB | 57 on 1×80 GiB |
+| Mistral 7B | 32 | 32 | 8 | 13.49 GiB | 128 KiB | 512 KiB | 4× | 1.00 GiB | 58 on 1×80 GiB |
+| Qwen 2.5 7B | 28 | 28 | 4 | 14.18 GiB | 56 KiB | 392 KiB | 7× | 448 MiB | 132 on 1×80 GiB |
+| Llama 3 70B | 80 | 64 | 8 | 131.42 GiB | 320 KiB | 2.5 MiB | 8× | 2.50 GiB | 62 on 4×80 GiB |
+
+```bash
+python kvcalc.py NousResearch/Meta-Llama-3-8B --gpu-gib 80 --context 8192
+python kvcalc.py mistralai/Mistral-7B-v0.1     --gpu-gib 80 --context 8192
+python kvcalc.py Qwen/Qwen2.5-7B               --gpu-gib 80 --context 8192
+python kvcalc.py NousResearch/Meta-Llama-3-70B --gpu-gib 320 --context 8192
+```
+
+**What GQA does.** In standard multi-head attention (MHA), every query head has its own K and V head, so each token caches K and V once per query head. Grouped-query attention lets a group of query heads share one K/V head. The KV formula only counts KV heads:
+
+```
+KV bytes per token = 2 × layers × kv_heads × head_dim × bytes
+```
+
+So the saving is exactly `query_heads / kv_heads`. The query heads still exist, and the model computes attention the same number of times. Only the cached state shrinks.
+
+**What the table shows:**
+
+- **The saving grows with the model.** Llama 3 8B and 70B both use 8 KV heads, but 70B has 64 query heads, so its GQA saving is 8×, against 4× for 8B. Without GQA, one 8k sequence on 70B would need 20 GiB of KV cache, and 4 H100s could hold only 7 sequences instead of 62.
+- **Qwen 2.5 7B squeezes hardest.** It has 4 KV heads and 28 layers, so it caches 56 KiB per token, less than half of Llama 3 8B's 128 KiB. Weights are about the same size, so it fits 132 sequences on one H100 against Llama's 57.
+- **Mistral 7B and Llama 3 8B have the same attention shape** (32 layers, 32 query heads, 8 KV heads, head_dim 128), so their KV cost is identical. Mistral fits one more sequence only because its smaller vocabulary (32k vs 128k) makes its weights about 1.5 GiB lighter.
+- **The 70B weights don't fit on one card.** 131 GiB of fp16 weights needs at least two H100s just to load; the 4-GPU figure treats the cards as one pool, so it's slightly optimistic (see Limitations).
+
 ## Supported architectures
 
 | Model | Attention | KV / token (fp16) | Max seqs (80 GiB, 8k ctx) |
@@ -140,7 +173,7 @@ Recent `llama-server` builds hide model-loading details at the default log level
 
 ## The Takeaways
 - GPU memory holds two things: weights and KV cache. Weights are a fixed cost. The KV cache scales with tokens and users, and engines like llama.cpp reserve all of it at startup. Once a model is loaded, the KV cache decides how many users one GPU can serve.
-- Most new attention designs exist to shrink the KV cache. Llama 3 8B's GQA makes its cache 4× smaller than plain multi-head attention would. - An 8-bit cache roughly halves it again (llama.cpp's q8_0 is 6% over half, because of block scales). MLA compresses it further, which is why DeepSeek-V2-Lite serves 180 sequences where Llama 3 8B serves 57, despite being twice Llama's size.
+- Most new attention designs exist to shrink the KV cache. Llama 3 8B's GQA makes its cache 4× smaller than plain multi-head attention would. An 8-bit cache roughly halves it again (llama.cpp's q8_0 is 6% over half, because of block scales). MLA compresses it further, which is why DeepSeek-V2-Lite serves 180 sequences where Llama 3 8B serves 57, despite being twice Llama's size.
 - MoE separates speed from memory. Speed comes from the active parameters (about 13B for Mixtral). Memory comes from the total (46.7B). So "fast and cheap per token" can still mean "needs two GPUs."
 - Weight precision and KV precision are separate settings. Quantizing the weights to 4-bit left the cache at f16. Changing both to fp8 took Llama 3 8B from 57 to 129 sequences; changing only one gives you less.
 - The formula is exact; the engine's accounting is where the surprises are. llama.cpp matched kvcalc to the MiB. The gaps came from how it counts: -c is a total split across slots, and quantized formats store extra bytes for scales.
